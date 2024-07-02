@@ -64,7 +64,7 @@ class ImgGroupModel:
         # For using huggingface transformer's SAM model
         if self.config.model_type == "sam_hf":
             if self.model is None:
-                self.model = pipeline("mask-generation", model="facebook/sam-vit-huge", device=self.device)
+                self.model = pipeline("mask-generation", model="yizhangliu/Grounded-Segment-Anything", device=self.device)
             img = Image.fromarray(img)
             masks = self.model(img, points_per_side=32, pred_iou_thresh=0.90, stability_score_thresh=0.90)
             masks = masks['masks']

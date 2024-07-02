@@ -8,6 +8,7 @@ import viser
 import viser.transforms as vtf
 import open3d as o3d
 import cv2
+from transformers import LlavaNextProcessor, LlavaNextForConditionalGeneration
 import time
 
 import torch
@@ -31,7 +32,10 @@ from scipy.spatial.transform import Rotation as Rot
 from garfield.garfield_datamanager import GarfieldDataManagerConfig, GarfieldDataManager
 from garfield.garfield_model import GarfieldModel, GarfieldModelConfig
 from garfield.garfield_pipeline import GarfieldPipelineConfig, GarfieldPipeline
-
+from garfield.garfield_automatic_scenetree_creation import TreeNode, SUD_VLM, SUD_Human, generate_candidate_clusters, add_child, visualize_tree, save_tree
+import numpy as np
+from nerfstudio.models.splatfacto import RGB2SH
+from .viser_text import ViserMarkdown
 
 def generate_random_colors(N=5000) -> torch.Tensor:
     """Generate random colors for visualization"""
@@ -108,16 +112,20 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         self.crop_to_group_level = ViewerSlider(name="Group Level", min_value=0, max_value=29, step=1, default_value=0, cb_hook=self._update_crop_vis, disabled=True)
         self.crop_group_list = []
 
-        self.move_current_crop = ViewerButton(name="Drag Current Crop", cb_hook=self._drag_current_crop, disabled=True)
+        self.move_current_crop = ViewerButton(name="Drag Current Crop", cb_hook=self._drag_current_crop, disabled=True, visible=False)
         self.crop_transform_handle = None
 
         self.cluster_scene = ViewerButton(name="Cluster Scene", cb_hook=self._cluster_scene, disabled=False, visible=False)
         self.cluster_scene_scale = ViewerSlider(name="Cluster Scale", min_value=0.0, max_value=2.0, step=0.01, default_value=0.0, disabled=False, visible=False)
         self.cluster_scene_shuffle_colors = ViewerButton(name="Reshuffle Cluster Colors", cb_hook=self._reshuffle_cluster_colors, disabled=False, visible=False)
+        self.prompt_box = ViewerText(name="Prompt", default_value = "What is shown in this image?")
+        self.prompt = "In single word, what is shown in this image?"
+        self.build_tree = ViewerButton(name="Analyze", cb_hook=self._build_tree, disabled=False)
         self.cluster_labels = None
+        # breakpoint()
+        self.vlm_output = ViserMarkdown("VLM Output")
 
         self.reset_state = ViewerButton(name="Reset State", cb_hook=self._reset_state, disabled=True)
-
         self.z_export_options = ViewerCheckbox(name="Export Options", default_value=False, cb_hook=self._update_export_options)
         self.z_export_options_visible_gaussians = ViewerButton(
             name="Export Visible Gaussians",
@@ -126,7 +134,11 @@ class GarfieldGaussianPipeline(VanillaPipeline):
             )
         self.z_export_options_camera_path_filename = ViewerText("Camera Path Filename", "", visible=False)
         self.z_export_options_camera_path_render = ViewerButton("Render Current Pipeline", cb_hook=self.render_from_path, visible=False)
-
+        
+        self.vlm_processor = LlavaNextProcessor.from_pretrained("llava-hf/llava-v1.6-mistral-7b-hf")
+        self.vlm = LlavaNextForConditionalGeneration.from_pretrained("llava-hf/llava-v1.6-mistral-7b-hf", torch_dtype=torch.float16, low_cpu_mem_usage=True) 
+        self.vlm.to("cuda:0")
+    
     def _update_interaction_method(self, dropdown: ViewerDropdown):
         """Update the UI based on the interaction method"""
         hide_in_interactive = (not (dropdown.value == "Interactive")) # i.e., hide if in interactive mode
@@ -176,8 +188,14 @@ class GarfieldGaussianPipeline(VanillaPipeline):
 
     def _queue_state(self):
         """Save current state to stack"""
-        import copy
-        self.state_stack.append(copy.deepcopy({k:v.detach() for k,v in self.model.gauss_params.items()}))
+        self.state_stack.append({
+            'means': self.model.means.detach().clone(),
+            'scales': self.model.scales.detach().clone(),
+            'quats': self.model.quats.detach().clone(),
+            'features_dc': self.model.features_dc.detach().clone(),
+            'features_rest': self.model.features_rest.detach().clone(),
+            'opacities': self.model.opacities.detach().clone(),
+        })
         self.reset_state.set_disabled(False)
 
     def _click_gaussian(self, button: ViewerButton):
@@ -188,14 +206,12 @@ class GarfieldGaussianPipeline(VanillaPipeline):
             self.click_gaussian.set_disabled(False)
             self.crop_to_click.set_disabled(False)
             self.viewer_control.unregister_click_cb(del_handle_on_rayclick)
-
         self.click_gaussian.set_disabled(True)
         self.viewer_control.register_click_cb(del_handle_on_rayclick)
 
     def _on_rayclick(self, click: ViewerClick):
         """On click, calculate the 3D position of the click and visualize it.
         Refer to garfield_interaction.py for more details."""
-
         cam = self.viewer_control.get_camera(500, None, 0)
         cam2world = cam.camera_to_worlds[0, :3, :3]
         import viser.transforms as vtf
@@ -295,12 +311,17 @@ class GarfieldGaussianPipeline(VanillaPipeline):
                 nn_model = NearestNeighbors(
                     n_neighbors=1, algorithm="auto", metric="euclidean"
                 ).fit(np.asarray(curr_points_ds.points))
-
-                _, indices = nn_model.kneighbors(np.asarray(keep_points.points)[~curr_points_ds_selected])
+                
+                try:
+                    _, indices = nn_model.kneighbors(np.asarray(keep_points.points)[~curr_points_ds_selected])
+                except:
+                    indices = None
+                    continue
 
                 clusters = np.zeros(len(keep_points.points), dtype=int)
                 clusters[curr_points_ds_selected] = _clusters
-                clusters[~curr_points_ds_selected] = _clusters[indices[:, 0]]
+                if indices is not None:
+                    clusters[~curr_points_ds_selected] = _clusters[indices[:, 0]]
 
             else:
                 clusters = np.asarray(keep_points.cluster_dbscan(eps=0.02, min_points=5))
@@ -330,6 +351,8 @@ class GarfieldGaussianPipeline(VanillaPipeline):
 
         if len(keep_list) == 0:
             print("No gaussians within crop, aborting")
+            self.vlm_output.set_value("No gaussians within crop, aborting")
+            self.viewer_control.viewer._trigger_rerender()
             # The only way to reset is to reset the state using the reset button.
             self.click_gaussian.set_disabled(False)
             self.crop_to_click.set_disabled(False)
@@ -344,6 +367,7 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         self.crop_to_group_level.set_disabled(False)
         self.crop_to_group_level.value = 29
         self.move_current_crop.set_disabled(False)
+
 
     def _update_crop_vis(self, number: ViewerSlider):
         """Update which click-based crop to visualize -- this requires that _crop_to_click has been called."""
@@ -365,7 +389,9 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         prev_state = self.state_stack[-1]
         for name in self.model.gauss_params.keys():
             self.model.gauss_params[name] = prev_state[name][keep_inds]
-
+        self.viewer_control.viewer._trigger_rerender()
+            
+            
     def _drag_current_crop(self, button: ViewerButton):
         """Add a transform control to the current scene, and update the model accordingly."""
         self.crop_to_group_level.set_disabled(True)  # Disable user from changing crop
@@ -418,16 +444,16 @@ class GarfieldGaussianPipeline(VanillaPipeline):
 
         labels = self.cluster_labels
 
-        features_dc = self.model.gauss_params['features_dc'].detach()
-        features_rest = self.model.gauss_params['features_rest'].detach()
+        features_dc = self.model.features_dc.detach()
+        features_rest = self.model.features_rest.detach()
         for c_id in range(0, labels.max().int().item() + 1):
             # set the colors of the gaussians accordingly using colormap from matplotlib
             cluster_mask = np.where(labels == c_id)
-            features_dc[cluster_mask] = RGB2SH(colormap[c_id, :3].to(self.model.gauss_params['features_dc']))
+            features_dc[cluster_mask] = RGB2SH(colormap[c_id, :3].to(self.model.features_dc))
             features_rest[cluster_mask] = 0
 
-        self.model.gauss_params['features_dc'] = torch.nn.Parameter(self.model.gauss_params['features_dc'])
-        self.model.gauss_params['features_rest'] = torch.nn.Parameter(self.model.gauss_params['features_rest'])
+        self.model.features_dc = torch.nn.Parameter(self.model.features_dc)
+        self.model.features_rest = torch.nn.Parameter(self.model.features_rest)
         self.cluster_scene_shuffle_colors.set_disabled(False)
 
     def _cluster_scene(self, button: ViewerButton):
@@ -550,7 +576,7 @@ class GarfieldGaussianPipeline(VanillaPipeline):
         map_to_tensors = {}
 
         with torch.no_grad():
-            positions = self.model.gauss_params['means'].cpu().numpy()
+            positions = self.model.means.cpu().numpy()
             map_to_tensors["positions"] = o3d.core.Tensor(positions, o3d.core.float32)
             map_to_tensors["normals"] = o3d.core.Tensor(np.zeros_like(positions), o3d.core.float32)
 
@@ -565,13 +591,13 @@ class GarfieldGaussianPipeline(VanillaPipeline):
                 for i in range(shs.shape[-1]):
                     map_to_tensors[f"f_rest_{i}"] = shs[:, i]
 
-            map_to_tensors["opacity"] = self.model.gauss_params['opacities'].data.cpu().numpy()
+            map_to_tensors["opacity"] = self.model.opacities.data.cpu().numpy()
 
-            scales = self.model.gauss_params['scales'].data.cpu().unsqueeze(-1).numpy()
+            scales = self.model.scales.data.cpu().unsqueeze(-1).numpy()
             for i in range(3):
                 map_to_tensors[f"scale_{i}"] = scales[:, i]
 
-            quats = self.model.gauss_params['quats'].data.cpu().unsqueeze(-1).numpy()
+            quats = self.model.quats.data.cpu().unsqueeze(-1).numpy()
 
             for i in range(4):
                 map_to_tensors[f"rot_{i}"] = quats[:, i]
@@ -603,4 +629,162 @@ class GarfieldGaussianPipeline(VanillaPipeline):
                 seconds=seconds,
                 output_format="video",
             )
-        self.model.train()
+        self.model.train()      
+
+    def _build_tree_original(self, button: ViewerButton):
+        full_scene_positions = self.model.means.detach()  # N x 3
+        initial_mask = np.ones(full_scene_positions.shape[0], dtype=int)
+        ######HYPERPARAMETERS######
+        curr_scale = 1 # starting scale to iterate from #TODO replace with scale of the initial crop you want to create a tree for
+        step_size = 0.05 # step size to iterate over scales
+        lowest_scale = 0.001 # lowest scale to stop at
+        threshold_rejected_SUD = 0.9 # threshold to check similarity between new proposal and proposals already rejected by SUD
+        threshold_similarity_existing_nodes = 0.9 # threshold to check similarity between new proposal and existing nodes
+        threshold_similarity_subset = 0.9 # threshold to check similarity between new proposal and subset of existing nodes
+        
+        
+        root = TreeNode(curr_scale, initial_mask) #create the root node with full scene mask
+        
+        # intialize the SUD model
+        SUD = SUD_Human()
+        
+        torch.cuda.empty_cache()
+        
+        def dfs(node, SUD, grouping_model, full_scene_positions):
+            create_children(SUD, node, grouping_model, full_scene_positions)
+            if node is None:
+                return
+            if node.children is None:
+                return
+            for child in node.children:
+                dfs(child, SUD, grouping_model, full_scene_positions)          
+        def create_children(SUD, node, grouping_model, full_scene_positions):
+            if node is None:
+                return
+            
+            # get the current scale and mask of the node
+            curr_scale = node.scale
+            indices = np.where(node.mask)
+            masked_positions = full_scene_positions[indices]
+            
+            # filter out mask proposals with a running list of included and rejected masks
+            included_masks = np.zeros((100, full_scene_positions.shape[0]))
+            included_masks[0, :] = node.mask
+            already_rejected_masks = np.zeros((100, full_scene_positions.shape[0]))
+            reject_count, included_count = 0, 1
+            # iterate over scales to get object proposals and use SUD to determine if they are separate objects
+            while curr_scale > lowest_scale:
+                print(f"Building tree at scale {curr_scale}...")
+                masked_labels = generate_candidate_clusters(grouping_model, masked_positions, curr_scale)
+                labels = np.zeros(full_scene_positions.shape[0], dtype=int)
+                labels[indices] = masked_labels + 1
+                
+                # 0 is the full scene and not a new separate object proposal
+                for c_id in range(1, labels.max() + 1): 
+                    cluster_mask = np.where(labels == c_id)
+                    binary_mask = np.zeros(full_scene_positions.shape[0], dtype=int)
+                    binary_mask[cluster_mask] = 1
+                    
+                    # filter out mask proposals using matrix multiplication
+                    mask_mul = included_masks[:included_count] @ binary_mask
+                    if np.divide(mask_mul, mask_mul + ((included_masks[:included_count] + 
+                        binary_mask) % 2).sum(axis=1)).max() > threshold_similarity_existing_nodes: 
+                        # filter out mask that already exist in the trees by checking if the current proposal has high similarity with existing nodes: AND / (AND + XOR) > threshold
+                        continue
+                    
+                    # if included_count > 1 and np.any(np.sum(binary_mask[:, np.newaxis] <= included_masks[1:included_count], axis=0) 
+                    #     >= threshold_similarity_subset * binary_mask.shape[0]): 
+                    #     #filter out mask proposals that are subsets of existing nodes
+                    #     continue
+                    
+                    if reject_count > 0 and np.divide(already_rejected_masks[:reject_count] \
+                        @ binary_mask, already_rejected_masks[:reject_count] @ binary_mask + 
+                        ((already_rejected_masks[:reject_count] + binary_mask) % 2).sum(axis=1)).max() \
+                        > threshold_rejected_SUD: #filter out proposals already rejected by SUD                       
+                        continue
+                    
+                    # check if the proposal is a separate object using SUD
+                    if SUD.type == "human":
+                        self._queue_state()
+                        self.cluster_labels = torch.Tensor(labels)
+                        features_dc = self.model.features_dc.detach()
+                        features_rest = self.model.features_rest.detach()
+                        features_dc[cluster_mask] = RGB2SH(torch.Tensor(np.array([57, 255, 20])/ 255.0).to(self.model.features_dc)) # mark the object in neon green
+                        features_rest[cluster_mask] = 0
+                        self.model.features_dc = torch.nn.Parameter(self.model.features_dc)
+                        self.model.features_rest = torch.nn.Parameter(self.model.features_rest)
+                        self.viewer_control.viewer._trigger_rerender()
+                        separate_object = SUD.get_separate_object()
+                        self._reset_state(None)
+                        self.viewer_control.viewer._trigger_rerender()
+                    elif SUD.type == "vlm":
+                        cam = self.viewer_control.get_camera(512, 512, 0)
+                        self.model.eval()
+                        outputs = self.model.get_outputs(cam.to(self.device))
+                        self.model.train()
+                        with torch.no_grad():
+                            raw_image = outputs["rgb"].cpu().numpy()
+                        self._queue_state()
+                        self.cluster_labels = torch.Tensor(labels)
+                        features_dc = self.model.features_dc.detach()
+                        features_rest = self.model.features_rest.detach()
+                        features_dc[cluster_mask] = RGB2SH(torch.Tensor(np.array([57, 255, 20])/ 255.0).to(self.model.features_dc)) # mark the object in neon green
+                        features_rest[cluster_mask] = 0
+                        self.model.features_dc = torch.nn.Parameter(self.model.features_dc)
+                        self.model.features_rest = torch.nn.Parameter(self.model.features_rest)
+                        self.viewer_control.viewer._trigger_rerender()
+                        self.model.eval()
+                        outputs = self.model.get_outputs(cam.to(self.device))
+                        self.model.train()
+                        with torch.no_grad():
+                            masked_image = outputs["rgb"].cpu().numpy()
+                        self._reset_state(None)
+                        self.viewer_control.viewer._trigger_rerender()
+                        separate_object = SUD.get_separate_object(raw_image, masked_image)
+                        
+                    # add the proposal to the tree 
+                    if separate_object:
+                        add_child(node, TreeNode(curr_scale, binary_mask))
+                        print("added child")
+                        included_masks[included_count, :] = binary_mask
+                        included_count += 1
+                    else:
+                        already_rejected_masks[reject_count, :] = binary_mask
+                        reject_count += 1
+                curr_scale -= step_size
+
+        with torch.no_grad():
+            grouping_model = self.garfield_pipeline[0].model
+            dfs(root, SUD, grouping_model, full_scene_positions)
+        import pdb; pdb.set_trace()
+        # visualize the tree    
+        scales = np.exp(self.model.scales.cpu().detach().numpy())
+        wxyzs = self.model.quats.cpu().detach().numpy()
+        rgbs = self.model.colors.cpu().detach().numpy()
+        means = self.model.means.cpu().detach().numpy()
+        opacities = self.model.opacities.cpu().detach().numpy()
+        visualize_tree(scales, wxyzs, means, rgbs, opacities, root)
+        save_tree(root, scales, wxyzs, rgbs, means, opacities, "./saved_tree.pkl")
+      
+    def _build_tree(self, button: ViewerButton):
+        cam = self.viewer_control.get_camera(512, 512, 0)
+        self.model.eval()
+        outputs = self.model.get_outputs(cam.to(self.device))
+        rgb = cv2.cvtColor(outputs["rgb"].detach().cpu().numpy(), cv2.COLOR_BGR2RGB)
+        cv2.imwrite("outputs/outputs.png", rgb*255)
+        rgb = rgb*255
+        rgb = rgb.astype(np.uint8)
+        prompt = f"[INST] <image>\n{self.prompt} [/INST]"
+        inputs = self.vlm_processor(prompt, rgb*255, return_tensors="pt").to("cuda:0")
+        output = self.vlm.generate(**inputs, max_new_tokens=16)
+        print(self.vlm_processor.decode(output[0], skip_special_tokens=True))
+        self.vlm_output.gui_handle.content = self.vlm_processor.decode(output[0], skip_special_tokens=True).split("[/INST]")[-1][1:]
+        self.viewer_control.viewer._trigger_rerender()
+        
+    
+    def _change_prompt(self, text: ViewerText):
+        self.prompt = text.value
+        print(self.prompt)
+        
+      
+      

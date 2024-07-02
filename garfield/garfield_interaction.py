@@ -3,6 +3,8 @@ from typing import List, Optional, Tuple, Union
 import viser
 import trimesh
 import torch.nn as nn
+import torch
+import numpy as np
 
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.field_components.field_heads import FieldHeadNames
